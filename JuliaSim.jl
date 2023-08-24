@@ -288,6 +288,8 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
     dt::AbstractFloat,max_mass::AbstractFloat,wall_constant::Number,sides::SVector{2,<: AbstractFloat},
     model::ABM)
     result::Vector{Union{Integer, AbstractFloat}} = [0,0,0,0,0]
+    result[1]=0
+    result[2]=agent.r
     if ! agent.IsPresent
         return result
     end
