@@ -31,7 +31,7 @@ Base.@kwdef mutable struct Parameters
     reds::Integer
     blues::Integer
     relaxation::Bool
-    results::Vector{Vector{Union{Integer,AbstractFloat}}}
+    results::Results
     packing_fraction::AbstractFloat
     max_packing_fraction::AbstractFloat
     pf_limited::Bool 
@@ -40,6 +40,14 @@ end
 Base.@kwdef mutable struct Outputs
     forces::Vector{SVector{2,<: AbstractFloat}}
     kill_list::Vector{Vector{Integer}}
+end
+Base.@kwdef mutable struct Results
+    current_mass::Vector{Float64}
+    new_mass::Vector{AbstractFloat}
+    current_r::Vector{AbstractFloat}
+    new_r::Vector{AbstractFloat}
+    kill_list::Vector{Integer}
+    divide_list::Vector{Integer}
 end
 import CellListMap.PeriodicSystems: copy_output, reset_output!, reducer
 copy_output(x::Outputs) = Outputs(deepcopy(x.forces), deepcopy(x.kill_list))
@@ -94,6 +102,15 @@ function initialize_model(;
     # The clmap_system field contains the data required for CellListMap.jl
     step::Integer=1
     area::AbstractFloat = sides[1]*sides[2]
+    #the agents will have a raidus and we get them here
+    radiuss::Vector{Float64}=rand(Uniform(min_radius,max_radius),number_of_particles)
+    append!(radiuss,ones(carrying_capacity-number_of_particles)*min_radius)
+    growth_rates::Vector{<: AbstractFloat}=rand(Uniform(0.9,1.1),carrying_capacity).*(π*(min_radius^2))
+    masss::Vector{<: AbstractFloat}=(radiuss.^2)*π
+    model.packing_fraction=sum(masss[1:number_of_particles])/model.area
+    blues::Integer = round(Integer,s_i*number_of_particles)
+    model.blues=blues 
+    model.reds=number_of_particles-blues
     properties = Parameters(
         dt,
         number_of_particles,
@@ -114,7 +131,7 @@ function initialize_model(;
         0,
         0,
         false,
-        Vector{Vector{Union{Integer,AbstractFloat}}}(),
+        Results(masss,masss,radiuss,radiuss,Int[],Int[]),
         0,
         max_packing_fraction,
         pf_limited,
@@ -125,31 +142,16 @@ function initialize_model(;
         properties=properties,
         scheduler=scheduler
     )
-    #the agents will have a raidus and we get them here
-    radiuss::Vector{Float64}=rand(Uniform(min_radius,max_radius),number_of_particles)
-    growth_rates::Vector{<: AbstractFloat}=rand(Uniform(0.9,1.1),number_of_particles).*(π*(min_radius^2))
-    masss::Vector{<: AbstractFloat}=(radiuss.^2)*π
-    model.packing_fraction=sum(masss)/model.area
-    blues::Integer = round(Integer,s_i*number_of_particles)
-    model.blues=blues 
-    model.reds=number_of_particles-blues
     # Create active agents with random radius
     for id in 1:carrying_capacity
-        if id<=number_of_particles
-            radius::AbstractFloat=radiuss[id]
-            cur_mass::AbstractFloat=masss[id]
-            cur_gr::AbstractFloat=growth_rates[id]
-            color = (id<=blues) ? :blue : :red
-            cur_k =  color==:blue ? k_r : 1
-            cur_pos=Tuple(positions[id])
-            isPresent=true
-        else
-            radius=model.min_radius
-            cur_mass=model.min_mass
-            cur_gr=growth_rates[begin]
-            color= :blue 
-            cur_k=k_r
-            cur_pos=Tuple(positions[begin])
+        radius::AbstractFloat=radiuss[id]
+        cur_mass::AbstractFloat=masss[id]
+        cur_gr::AbstractFloat=growth_rates[id]
+        color = (id<=blues) ? :blue : :red
+        cur_k =  color==:blue ? k_r : 1
+        cur_pos=Tuple(positions[id])
+        isPresent=true
+        if id>number_of_particles
             isPresent=false 
         end
         add_agent!(
@@ -175,7 +177,8 @@ function model_step!(model::ABM)
     )
     model.results = agents_parallel(model) #makes all the cells move, and gets the change in mass, new radius, cells to kill, and divide
     if ! model.relaxation
-        kill_from_results!(model) #death can always happen 
+        lost_mass=kill_from_results(model) #death can always happen (the model.results[6] is only living mass)
+        model.packing_fraction = (sum(model.results[6])-lost_mass)/model.area
         filter_results_from_death!(model) #remove killed cells from mass/r/activation
         grow_model!(model)
         divide_model!(model)
@@ -189,19 +192,26 @@ function filter_results_from_death!(model::ABM)
     # Convert kill_list to a Set for O(1) lookups
     kill_set = Set(model.results[3])
     # Filter out values from activation_order, new_r, and change_mass
+    divider=model.results[4]
     activation_order=model.results[5]
+    mass=model.results[6]
     filtered_activation_order = Int[]
     filtered_new_r = Float64[]
     filtered_change_mass = Float64[]
+    filtered_divide = Int[]
+    filtered_mass= Float64[]
     for i in eachindex(activation_order)
         if !(activation_order[i] in kill_set)
             push!(filtered_activation_order, activation_order[i])
             push!(filtered_new_r, new_r[i])
             push!(filtered_change_mass, change_mass[i])
+            push!(filtered_mass,mass[i])
         end
     end
+    filtered_divide=filter(x -> !(x in kill_set),divider)
     model.results[1]=filtered_change_mass
     model.results[2]=filtered_new_r
+    model.results[4]=filtered_divide
     model.results[5]=filtered_activation_order
 end
 function divide_model!(model::ABM)
@@ -226,7 +236,7 @@ function grow_model!(model::ABM)
         if model.packing_fraction >= model.max_packing_fraction
             return nothing
         end
-        idx=idx_of_cumulative_value(model.results[1],(model.max_packing_fraction-model.packing_fraction)*model.area)
+        idx=idx_of_cumulative_value(model.results[1],(model.max_packing_fraction-model.packing_fraction)*model.area) #we update the packing fraction at the begining of each time step 
         if idx===nothing
             return nothing 
         end
@@ -240,9 +250,8 @@ function grow_model!(model::ABM)
         ids=model.results[5][1:idx]
     end
     @sync for i in eachindex(ids)
-        Threads.@spawn _grow_parallel(ids[i],new_r[i],mass_change[i])
+        Threads.@spawn _grow_parallel(ids[i],new_r[i],mass_change[i]) 
     end
-    model.packing_fraction=(sum(mass_change)+model.packing_fraction*model.area)/model.area
 end
 function _grow_parallel(id::Integer,new_r::AbstractFloat,mass_change::AbstractFloat)
     agent=model[id]
@@ -293,12 +302,13 @@ end
 function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relaxation::Bool,periodic::Bool,
     dt::AbstractFloat,max_mass::AbstractFloat,wall_constant::Number,sides::SVector{2,<: AbstractFloat},
     model::ABM)
-    result::Vector{Union{Integer, AbstractFloat}} = [0,0,0,0,0]
+    result::Vector{Union{Integer, AbstractFloat}} = [0,0,0,0,0,0]
     result[1]=0
     result[2]=agent.r
     if ! agent.IsPresent
         return result
     end
+    result[6]=agent.mass
     id=agent.id
     #grow radius and mass 
     divide::Bool = agent.r >= max_radius
@@ -346,11 +356,14 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
     @inbounds model.system.positions[id] = SVector{2,AbstractFloat}(agent.pos)
     return result
 end
-function kill_from_results!(model::ABM)
+function kill_from_results(model::ABM)
     #death can always happen 
+    lost_mass=0
     for looser in model.results[3]
         remove_cell!(model[looser],model)
+        lost_mass+=model[looser].mass
     end
+    return lost_mass
 end
 function idx_of_cumulative_value(vec::Vector{T}, value::T) where T
     # Compute the cumulative sum
@@ -379,19 +392,21 @@ function agent_parallel_result(futures::Vector{Vector{Union{Integer, AbstractFlo
     new_r::Vector{AbstractFloat}=[]
     kill_list::Vector{Integer} = []
     divide_list::Vector{Integer} = []
+    current_mass::Vector{Float64}= [] #6
     # Fetch results and reduce
     for fut in futures
         append!(mass_change, fut[1])
         append!(new_r, fut[2])
         append!(kill_list, fut[3])
         append!(divide_list, fut[4])
+        append!(current_mass,fut[6])
     end
     filter!(x -> x ≠ 0, kill_list)
     filter!(x -> x ≠ 0, divide_list)
-    return [mass_change, new_r ,kill_list, divide_list, activation_order]
+    return [mass_change, new_r ,kill_list, divide_list, activation_order,current_mass]
 end
 function agent_divide!(agent::Particle,model::ABM)
-    if ! agent.IsPresent
+    if (! agent.IsPresent) || (agent.mass < model.max_mass) || (agent.r < model.max_radius)
         return nothing
     end
     pos1::SVector{2,<: AbstractFloat}=model.system.positions[agent.id]
@@ -406,7 +421,6 @@ function agent_divide!(agent::Particle,model::ABM)
     old_mass::Float64=agent.mass
     agent.mass = model.min_mass
     agent.pos=Tuple(new_pos)
-    model.packing_fraction = (model.packing_fraction*model.area-old_mass+agent.mass)/model.area
     # !!! IMPORTANT: Update positions in the CellListMap.PeriodicSystem
     @inbounds model.system.positions[agent.id] = SVector{2,AbstractFloat}(agent.pos)
     add_cell!(sp1,agent.kill_rate,agent.color,model)
@@ -423,7 +437,6 @@ function add_cell!(position::SVector{2, <: AbstractFloat},k_r::AbstractFloat,col
     agent.color = color 
     @inbounds model.system.positions[id]=position  # bring that cell back into an active position real
     model.number_of_particles +=1
-    model.packing_fraction = (model.packing_fraction*model.area + agent.mass)/model.area
     agent.pos=Tuple(position)
     if agent.color==:blue
         model.blues+=1
@@ -439,7 +452,6 @@ function remove_cell!(cell::Particle, model::ABM)
     cell.pos=Tuple(new_pos)
     @inbounds model.system.positions[cell.id]=SVector{2,AbstractFloat}(new_pos)
     model.number_of_particles -=1 
-    model.packing_fraction = (model.packing_fraction*model.area - cell.mass)/model.area
     if cell.color==:blue
         model.blues-=1
     else
