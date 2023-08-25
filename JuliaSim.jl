@@ -1,4 +1,4 @@
-using CellListMap.PeriodicSystems, StaticArrays, Random, Agents, Distributions, Plots, StatsPlots, DataFrames, StatProfilerHTML, CSV,  GeometryBasics, SharedArrays
+using CellListMap.PeriodicSystems, StaticArrays, Random, Agents, Distributions, Plots, StatsPlots, DataFrames, StatProfilerHTML, CSV,  GeometryBasics, SharedArrays, Debugger
 using Base.Iterators: accumulate
 #the ContinuousAgent needs a velocity, but as these cells are sticky I just set all calls to zero
 @agent Particle ContinuousAgent{2} begin
@@ -174,16 +174,16 @@ function model_step!(model::ABM)
         model.system,
     )
     model.results = agents_parallel(model) #makes all the cells move, and gets the change in mass, new radius, cells to kill, and divide
-    kill_from_results!(model) #death can always happen 
-    filter_mass_r!(model) #remove killed cells from mass/r/activation
-    grow_model!(model)
-    divide_model!(model)
     if ! model.relaxation
+        kill_from_results!(model) #death can always happen 
+        filter_results_from_death!(model) #remove killed cells from mass/r/activation
+        grow_model!(model)
+        divide_model!(model)
         model.step+=1
     end
     return nothing
 end
-function filter_mass_r!(model::ABM)
+function filter_results_from_death!(model::ABM)
     change_mass=model.results[1]
     new_r=model.results[2]
     # Convert kill_list to a Set for O(1) lookups
@@ -209,21 +209,27 @@ function divide_model!(model::ABM)
     done=false
     i=1
     ids=model.results[4]
-    if (length(ids)==0) || (model.cc_limited && (model.number_of_particles>=model.carrying_capacity)) || (i > num_possible)
+    if (length(ids)==0) || ((model.number_of_particles>=model.carrying_capacity)) || (i > num_possible)
         return nothing 
     end
     while ! done
         @inbounds cur_id=ids[i]
         agent_divide!(model[cur_id],model)
         i+=1
-        if (model.cc_limited && (model.number_of_particles>=model.carrying_capacity)) || (i > num_possible)
+        if ((model.number_of_particles>=model.carrying_capacity)) || (i > num_possible)
             done=true
         end
     end
 end
 function grow_model!(model::ABM)
     if model.pf_limited #only some grow in this case
+        if model.packing_fraction >= model.max_packing_fraction
+            return nothing
+        end
         idx=idx_of_cumulative_value(model.results[1],(model.max_packing_fraction-model.packing_fraction)*model.area)
+        if idx===nothing
+            return nothing 
+        end
         mass_change=model.results[1][1:idx]
         new_r=model.results[2][1:idx]
         ids=model.results[5][1:idx]
@@ -298,7 +304,7 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
     divide::Bool = agent.r >= max_radius
     if (! divide) && (! relaxation) #no grow if able to divide or relaxing
         #if carrying_capacity is non-zero then you can grow however you want 
-        old_mass::AbstractFloat=agent.r
+        old_mass::AbstractFloat=copy(agent.mass)
         del_r::AbstractFloat=(agent.growth_rate .* dt / (2*π*agent.r))
         new_r::AbstractFloat=del_r .+ agent.r
         #some divide if the number_of_particles is less than the carrying capacity
@@ -349,11 +355,15 @@ end
 function idx_of_cumulative_value(vec::Vector{T}, value::T) where T
     # Compute the cumulative sum
     cumsum_vec = accumulate(+, vec)
+    # Convert the Accumulate iterator to an array
+    cumsum_array = collect(cumsum_vec)
     # Find the index where the cumulative sum equals or exceeds the set value
-    idx = findfirst(>=(value), cumsum_vec)
+    idx = findfirst(>=(value), cumsum_array)
     # If no such index is found, return the entire vector
-    if idx === nothing
-        return length(t)
+    if (idx === nothing) && (cumsum_array[end]<value)
+        return length(vec)
+    elseif idx===1
+        return nothing
     end
     # Slice the vector from 1 to the found index
     return idx
@@ -393,14 +403,16 @@ function agent_divide!(agent::Particle,model::ABM)
     #mom is moved the fp1 and the daughter is added at sp1
     new_pos = fp1
     agent.r = model.min_radius
+    old_mass::Float64=agent.mass
     agent.mass = model.min_mass
     agent.pos=Tuple(new_pos)
+    model.packing_fraction = (model.packing_fraction*model.area-old_mass+agent.mass)/model.area
     # !!! IMPORTANT: Update positions in the CellListMap.PeriodicSystem
     @inbounds model.system.positions[agent.id] = SVector{2,AbstractFloat}(agent.pos)
     add_cell!(sp1,agent.kill_rate,agent.color,model)
 end
 function add_cell!(position::SVector{2, <: AbstractFloat},k_r::AbstractFloat,color::Symbol,model::ABM)
-    id =  last(model.avaliable_ids)
+    id = last(model.avaliable_ids)
     pop!(model.avaliable_ids)
     #the agent is already in the system, we just need to change it now
     @inbounds agent=model[id]    
@@ -411,6 +423,7 @@ function add_cell!(position::SVector{2, <: AbstractFloat},k_r::AbstractFloat,col
     agent.color = color 
     @inbounds model.system.positions[id]=position  # bring that cell back into an active position real
     model.number_of_particles +=1
+    model.packing_fraction = (model.packing_fraction*model.area + agent.mass)/model.area
     agent.pos=Tuple(position)
     if agent.color==:blue
         model.blues+=1
