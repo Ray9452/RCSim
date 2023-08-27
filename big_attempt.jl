@@ -18,7 +18,8 @@ Base.@kwdef mutable struct Results
     new_r::Vector{AbstractFloat}
     kill_list::Vector{Integer}
     divide_list::Vector{Integer}
-    activation_order::Vector{Integer}
+    new_pos::Vector{SVector{2, <: AbstractFloat}}
+
 end
 Base.@kwdef mutable struct Parameters
     dt::AbstractFloat
@@ -132,7 +133,7 @@ function initialize_model(;
         reds,
         blues,
         false,
-        Results(masss,masss,radiuss,radiuss,Int[],Int[],Int[]),
+        Results(masss,masss,radiuss,radiuss,Int[],Int[],similar(positions)),
         packing_fraction,
         max_packing_fraction,
         pf_limited,
@@ -179,27 +180,12 @@ function model_step!(model::ABM)
     agents_parallel!(model) #makes all the cells move, and gets the results and changes the .field in place
     if ! model.relaxation
         kill_from_results!(model) #death can always happen
-        filter_results_from_death!(model) #remove killed cells from mass/r/activation
         model.packing_fraction = (sum(model.results.current_mass))/model.area #as any dead cells during the step should have 0 mass 
         grow_model!(model)
         divide_model!(model)
         model.step+=1
     end
     return nothing
-end
-function filter_results_from_death!(model::ABM)
-    #we want a clean decision as to who grows and divides so we need to change so change the mass/radius in results and remove killed cell ids from the divide list
-    # Convert kill_list to a Set for O(1) lookups
-    kill_set = Set(model.results.kill_list)
-    for i in eachindex(model.results.activation_order)
-        if (model.results.activation_order[i] in kill_set) #just died (kill set will always be small so this shouldnt be too long)
-            model.results.current_mass[i]=0
-            model.results.new_mass[i]=0
-            model.results.current_r[i]=0
-            model.results.new_r[i]=0
-        end
-    end
-    filter!(x -> !(x in kill_set),model.results.divide_list) #not in the divide list now 
 end
 function divide_model!(model::ABM)
     num_possible=length(model.results.divide_list)
@@ -219,40 +205,33 @@ function divide_model!(model::ABM)
     end
 end
 function grow_model!(model::ABM)
+    change_in_mass::Vector{Float64} = (model.results.new_mass -  model.results.current_mass)
+    #to not favor low id in growth order 
+    shuffled_order = shuffle(1:model.carrying_capacity)
+    shuffled_new_mass = model.results.new_mass[shuffled_order]
+    shuffled_new_r=model.results.new_r[shuffled_order]
+    shuffled_change_in_mass = change_in_mass[shuffled_order]
     if model.pf_limited #only some grow in this case
-        if model.packing_fraction >= model.max_packing_fraction
-            return nothing
+        #find idx
+        idx = idx_of_cumulative_value(shuffled_change_in_mass, (model.max_packing_fraction - model.packing_fraction) * model.area)
+        if idx===nothing || (model.packing_fraction >= model.max_packing_fraction)
+            idx=0
         end
-        change_in_mass::Vector{Float64} = (model.results.new_mass -  model.results.current_mass)
-        idx=idx_of_cumulative_value(change_in_mass,(model.max_packing_fraction-model.packing_fraction)*model.area) #we update the packing fraction at each time step 
-        if idx===nothing
-            return nothing 
-        end
-        model.packing_fraction=(sum(change_in_mass[1:idx]) + model.packing_fraction*model.area)/model.area
         #only put in ids with living cells to save on headaches 
-        ids = Int[]
-        new_r = Float64[]
-        new_mass = Float64[]
-        for cur_id in model.results.activation_order[1:idx]
-            if (model.results.current_mass[cur_id] != 0 )
-                push!(ids,cur_id)
-                push!(new_r,model.results.new_r[cur_id])
-                push!(new_mass,model.results.new_mass[cur_id])
-            end
-        end
     elseif model.cc_limited #everyone grows 
-        ids=model.results.activation_order
-        new_r=model.results.new_r
-        new_mass=model.results.new_mass
+        idx=length(model.carrying_capacity)
     end
-    @sync for i in eachindex(ids)
-        Threads.@spawn _grow_parallel(ids[i],new_r[i],new_mass[i]) 
+    @inbounds model.packing_fraction=(sum(shuffled_change_in_mass[1:idx]) + model.packing_fraction*model.area)/model.area
+    for i in eachindex(shuffled_order)
+        id=shuffled_order[i]
+        @inbounds agent=model[id]
+        if i <= idx && agent.IsPresent
+            @inbounds agent.r=shuffled_new_r[i]
+            @inbounds agent.mass=shuffled_new_mass[i]
+        end
+        agent.pos = Tuple(model.results.new_pos[id])
+        model.system.positions[id]=SVector{2,Float64}(agent.pos)
     end
-end
-function _grow_parallel(id::Integer,new_r::AbstractFloat,new_mass::AbstractFloat)
-    agent=model[id]
-    agent.r=new_r
-    agent.mass=new_mass
 end
 function calc_forces!(x::SVector{2,<: AbstractFloat}, y::SVector{2,<: AbstractFloat}, i::Integer, 
     j::Integer, d2::AbstractFloat, outputs::Outputs, model::ABM)
@@ -277,54 +256,75 @@ function calc_forces!(x::SVector{2,<: AbstractFloat}, y::SVector{2,<: AbstractFl
     return outputs
 end
 function agents_parallel!(model::ABM)
-    # In parallel, we can have all the cells move/grow
-    # Collect where new cells must be added/removed and then we do that in series
-    activation_order::Vector{Int64} = Agents.schedule(model)
+    activation_order::Vector{Int64} = 1:model.carrying_capacity
+    num_threads = Threads.nthreads()
+    chunk_size = ceil(Int, length(activation_order) / num_threads)
     # This will now store the results of the tasks, not the tasks themselves
-    futures = Vector{Vector{Union{Integer, AbstractFloat}}}(undef, length(activation_order))
-    @sync for (idx, id) in enumerate(activation_order)
-        # Spawn the task with the data and store the result directly in futures
+    futures = Vector{Vector{Union{Integer, AbstractFloat, SVector{2, <: AbstractFloat}}}}(undef, length(activation_order))
+    local_futures = Vector{Vector{Vector{Union{Integer, AbstractFloat, SVector{2, <: AbstractFloat}}}}}(undef, num_threads)
+    local_outputs = Vector{typeof(model.system.outputs)}(undef, num_threads)
+    @sync for t in 1:num_threads
+        # Calculate the range of indices this thread will work on
+        start_idx = (t-1)*chunk_size + 1
+        end_idx = min(t*chunk_size, length(activation_order))
+        #data each thread needs 
+        @inbounds local_agents = deepcopy([model.agents[id] for id in activation_order[start_idx:end_idx]])
+        local_outputs[t] = deepcopy(model.system.outputs)
         Threads.@spawn begin
-            result = agent_parallel_activate($model.agents[id], $model.max_radius, $model.relaxation, 
-                $model.periodic, $model.dt, $model.max_mass, $model.wall_constant, 
-                $model.sides, model)
-            futures[idx] = result
+            local_result = Vector{Vector{Union{Integer, AbstractFloat, SVector{2, <: AbstractFloat}}}}(undef, end_idx - start_idx + 1)
+            for (local_idx, idx) in enumerate(start_idx:end_idx)
+                result = agent_parallel_activate(local_agents[local_idx], $model.max_radius, $model.relaxation, 
+                    $model.periodic, $model.dt, $model.max_mass, $model.wall_constant, 
+                    $model.sides, local_outputs[t])
+                local_result[local_idx] = result
+            end
+            local_futures[t] = local_result
         end
     end
+    # Merge local results into the main futures vector
+    for t in 1:num_threads
+        start_idx = (t-1)*chunk_size + 1
+        end_idx = min(t*chunk_size, length(activation_order))
+        futures[start_idx:end_idx] = local_futures[t]
+    end
     # Now, the futures vector contains the results of all tasks
-    agent_parallel_reduce!(futures, activation_order)
-end    
-function agent_parallel_reduce!(futures::Vector{Vector{Union{Integer, AbstractFloat}}},activation_order::Vector{Int64})
+    agent_parallel_reduce!(futures)
+end
+function agent_parallel_reduce!(futures::Vector{Vector{Union{Integer, AbstractFloat,SVector{2, <: AbstractFloat}}}})
+    #reduce 
     # Initialize result
-    mass::Vector{AbstractFloat} = []
-    new_mass::Vector{AbstractFloat} = []
-    current_r::Vector{AbstractFloat}=[]
-    new_r::Vector{AbstractFloat}=[]
-    kill_list::Vector{Integer} = []
-    divide_list::Vector{Integer} = []
+    mass::Vector{AbstractFloat} = Vector{AbstractFloat}()
+    new_mass::Vector{AbstractFloat} = Vector{AbstractFloat}()
+    current_r::Vector{AbstractFloat}=Vector{AbstractFloat}()
+    new_r::Vector{AbstractFloat}=Vector{AbstractFloat}()
+    kill_list::Vector{Integer} = Vector{Integer}()
+    divide_list::Vector{Integer} = Vector{Integer}()
+    new_pos::Vector{SVector{2,Float64}} = Vector{SVector{2,Float64}}()
     # Fetch results and reduce
     for fut in futures
-        append!(mass, fut[1])
-        append!(new_mass,fut[2])
-        append!(current_r, fut[3])
-        append!(new_r, fut[4])
-        append!(kill_list, fut[5])
-        append!(divide_list, fut[6])
-    end
+        push!(mass, fut[1])
+        push!(new_mass,fut[2])
+        push!(current_r, fut[3])
+        push!(new_r, fut[4])
+        push!(kill_list, fut[5])
+        push!(divide_list, fut[6])
+        push!(new_pos,fut[7])
+ end
     filter!(x -> x ≠ 0, kill_list)
     filter!(x -> x ≠ 0, divide_list)
-    model.results=Results(mass,new_mass,current_r,new_r,kill_list,divide_list,activation_order)
+    model.results=Results(mass,new_mass,current_r,new_r,kill_list,divide_list,new_pos)
 end
 function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relaxation::Bool,periodic::Bool,
     dt::AbstractFloat,max_mass::AbstractFloat,wall_constant::Number,sides::SVector{2,<: AbstractFloat},
-    model::ABM)
-    result::Vector{Union{Integer, AbstractFloat}} = Vector{Union{Integer, AbstractFloat}}()
+    outputs::Outputs)
+    result::Vector{Union{Integer, AbstractFloat,SVector{2, <: AbstractFloat}}} = Vector{Union{Integer, AbstractFloat,SVector{2, <: AbstractFloat}}}()
     push!(result,agent.mass)
     push!(result,agent.mass)
     push!(result,agent.r)
     push!(result,agent.r)
     push!(result,0)
     push!(result,0)
+    push!(result, SVector{2,AbstractFloat}(agent.pos)::SVector{2,AbstractFloat})
     if ! agent.IsPresent
         return result
     end
@@ -343,12 +343,12 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
         result[4]=new_r #new radius 
     end
     #deal with killing now
-    @inbounds kill_list::Vector{Integer}=model.system.outputs.kill_list[id]
+    @inbounds kill_list::Vector{Integer}=outputs.kill_list[id]
     if (! isempty(kill_list)) && (! relaxation)
         prob::AbstractFloat = agent.kill_rate*dt
         if rand()<prob
             looser_index::Integer = rand(1:length(kill_list))
-            looser::Integer =  kill_list[looser_index]
+            @inbounds looser::Integer =  kill_list[looser_index]
             @inbounds result[5]=looser
         end
     end
@@ -357,7 +357,7 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
     end
     cur_pos=SVector{2, <: AbstractFloat}(agent.pos)
     # Retrieve the forces on agent id
-    @inbounds f::SVector{2, <: AbstractFloat} = model.system.outputs.forces[id]
+    @inbounds f::SVector{2, <: AbstractFloat} = outputs.forces[id]
     if ! periodic
         wf::SVector{2,AbstractFloat}=wall_force(cur_pos, agent, wall_constant,sides)
         f = @. f + wf
@@ -369,30 +369,34 @@ function agent_parallel_activate(agent::Particle,max_radius::AbstractFloat,relax
     if periodic
         new_pos = enforce_periodic_bounds(new_pos,sides)
     end
-    agent.pos=Tuple(new_pos)
-    # !!! IMPORTANT: Update positions in the CellListMap.PeriodicSystem
-    @inbounds model.system.positions[id] = SVector{2,AbstractFloat}(agent.pos)
+    result[7]=SVector{2,AbstractFloat}(new_pos)::SVector{2,AbstractFloat}
     return result
 end
 function kill_from_results!(model::ABM)
     #death can always happen 
     new_kill_list = Int[]
     for looser in model.results.kill_list
-        cell=model[looser]
+        cell=model.agents[looser]
         if cell.IsPresent #just a check just in case
             remove_cell!(cell,model)
-            append!(new_kill_list,looser)
+            push!(new_kill_list,looser)
+            model.results.current_mass[looser]=0
+            model.results.new_mass[looser]=0
+            model.results.current_r[looser]=0
+            model.results.new_r[looser]=0
         end
     end
     model.results.kill_list=new_kill_list
+    kill_set=Set(model.results.kill_list)
+    filter!(x -> !(x in kill_set),model.results.divide_list) #no dividing killed cells 
     return nothing
 end
 function remove_cell!(cell::Particle, model::ABM)
     push!(model.avaliable_ids,cell.id)
     #update celllistmap by launching the position into oblivion until needed to avoid calc forces with it (lord help me if this works)
-    new_pos=SVector{2,AbstractFloat}(cell.pos)+(rand(Uniform(1,10)))*model.sides
-    cell.pos=Tuple(new_pos)
-    @inbounds model.system.positions[cell.id]=SVector{2,AbstractFloat}(new_pos)
+    #new_pos=SVector{2,AbstractFloat}(cell.pos)+(rand(Uniform(1,10)))*model.sides
+    #cell.pos=Tuple(new_pos)
+    #@inbounds model.system.positions[cell.id]=SVector{2,AbstractFloat}(new_pos)
     if cell.color==:blue
         model.blues-=1
     else
@@ -496,7 +500,7 @@ function simulate(model::ABM; nsteps::Integer=1,relaxation::Bool=false,early_sto
     if relaxation
         model.relaxation=true
         step!(
-            model, dummystep, model_step!, 100, false,
+            model, dummystep, model_step!, 200, false,
         ) 
         model.relaxation=false
     end
@@ -599,3 +603,36 @@ function base_graphs(agent_data::DataFrame;file::String="")
     p1=plot!(data3,label="Slower Killing Strain",color=:blue)
     plot(p1)
 end
+    #start parallel 
+    #num_threads = Threads.nthreads()
+    #chunk_size = ceil(Int, length(ids) / num_threads)
+    #local_agents_copies = [deepcopy(model.agents) for _ in 1:num_threads]
+    #local_results_copies = [deepcopy(model.results) for _ in 1:num_threads]
+    #local_new_r = [deepcopy(new_r) for _ in 1:num_threads]
+    #local_new_mass = [deepcopy(new_mass) for _ in 1:num_threads]
+    #@sync for t in 1:num_threads
+    #    start_idx = (t-1)*chunk_size + 1 
+    #    end_idx = min(t*chunk_size, length(ids))
+    #    Threads.@spawn begin
+    #        for i in start_idx:end_idx
+    #            @inbounds agent=local_agents_copies[t][ids[i]]
+    #            if (i <=idx) && agent.IsPresent
+    #                @inbounds agent.r=local_new_r[t][i]
+    #                @inbounds agent.mass=local_new_mass[t][i]
+    #            end
+    #            @inbounds agent.pos =Tuple(local_results_copies[t].new_pos[i])
+    #        end
+    #    end
+    #end
+#
+    ## Merge the modified local copies back into the main model.agents
+    #for t in 1:num_threads
+    #    start_idx = (t-1)*chunk_size + 1
+    #    end_idx = min(t*chunk_size, length(ids))
+    #    for i in start_idx:end_idx
+    #        @inbounds model.agents[ids[i]] = local_agents_copies[t][ids[i]]
+    #        #UPDATE CELLLIST MAP POSITION 
+    #        @inbounds model.system.positions[ids[i]] = SVector{2,AbstractFloat}(model.agents[ids[i]].pos)
+#
+    #    end
+    #end
